@@ -16,6 +16,7 @@ type client struct {
 	shutdown chan struct{}
 	conn     *lspnet.UDPConn
 	connId   int
+	params   *Params
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -48,7 +49,9 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		connect:  make(chan struct{}), // To signify a successful connection
 		shutdown: make(chan struct{}), // To signify a shutdown
 		conn:     conn,                // The dialed UDP connection
-		connId:   -1,                  // ID of the connection. Shouldn't be -1 tho. lol.
+		connId:   -1,                  // ID of the connection. Set on connection.
+		params:   params,              // Parameters
+        toWrite:  List.New()
 	}
 
 	// Start Master, Net, and Epoch.
@@ -60,7 +63,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	c.send <- NewConnect()
 	<-c.connect
 
-	return nil, errors.New("not yet implemented")
+	return c, nil
 }
 
 func (c *client) ConnID() int {
@@ -91,8 +94,18 @@ func (c *client) masterHandler() {
 		case msg := <-c.receive:
 			fmt.Println("Received: ")
 			fmt.Println(msg.String())
+
+			// Handle Acknowledgements
 			if msg.Type == MsgAck {
-				close(c.connect)
+
+				// Is it a connection response?
+                // TODO: Move this to newClient, can't write until connection anyways.
+				if msg.SeqNum == 0 && c.ConnID() == -1 {
+					c.connId = msg.ConnID // Set the connection ID
+					close(c.connect)      // Close the connection notifier
+					c.connect = nil       // REALLY close it. Ha.
+					fmt.Println(c.ConnID())
+				}
 			}
 		case msg := <-c.send:
 			fmt.Println("Sent: ")
@@ -114,12 +127,17 @@ func (c *client) netHandler() {
 	// Unmarshal
 	var msg Message
 	json.Unmarshal(buf[0:n], &msg)
+
 	c.receive <- &msg
 }
 
 func (c *client) epochHandler() {
-	select {} // lol nothing
+	select {} // lol nothing yet
 }
+
+//
+// Helpers
+//
 
 func (c *client) sendMessage(msg *Message) error {
 	bytes, err := json.Marshal(msg)
