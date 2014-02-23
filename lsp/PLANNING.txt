@@ -1,0 +1,58 @@
+PLANNING
+
+Client
+    receives a message of type
+        ACK
+            if msg.seqNum = 0 // response to connection
+                set connection ID, ready to connect, etc.
+            else
+                send to SendWindow, which // c.sendWindow.add(msg)
+                    checks if it's in the window
+                        true -> replace data with ack
+                        false -> ignore it
+                send messages in writeQueue until they're out of window range
+        DATA
+            send to ReceiveWindow, which
+                checks to see if it's higher than old window
+                    true -> update window, toss out lowest
+                    false -> add it to the ReceiveWindow, if necessary
+                    NOTE: if you get something out of window range, that's bad.
+                Update messages in read queue.
+        CONN
+            Something's wrong, you shouldn't get that.
+
+    sends a new data message (assuming has SeqNum already)
+        check if window has room
+            true -> send it, add to SendWindow
+            false -> add to send queue
+
+
+
+SendWindow - Ensures sent messages were received
+    has the following fields:
+        window : map [int -> msg]        represents sent messages
+        base : int                       represents bottom of window
+        size : int                       represents window size
+    has the following functions:
+        add(msg) : nil ->
+                if inWindow(msg) -> add to map, error otherwise
+        ack(msg) : bool ->
+                acks sent message, updates window
+                returns true if window is updated, false otherwise
+        inWindow(msg) : bool ->
+                checks if message is in range of sending
+
+ReceiveWindow - Caches the last [windowsize] messages
+    has the following fields:
+        window : map [int -> msg]       represents received messages
+        base : int                       represents bottom of window
+        size : int                       represents window size
+    has the following functions:
+        receive(msg) : nil ->
+                Adds to map, updating window if necessary
+
+
+
+??????
+Do we need to send the LAST w messages received, or the ones IN the range of w received?
+[1, 3, 4] or [3, 4] if our window is [2, 3, 4]
