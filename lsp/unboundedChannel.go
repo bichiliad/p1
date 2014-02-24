@@ -7,30 +7,37 @@ import (
 type T *Message
 
 type UChannel struct {
-	in  chan T // input
-	out chan T // output
+	in      chan T // input
+	out     chan T // output
+	closing bool
 }
 
 func NewUnboundedChannel() *UChannel {
 	in, out := make(chan T), make(chan T)
-	go handleBuffer(in, out)
 
-	return &UChannel{
-		in:  in,
-		out: out,
+	u := &UChannel{
+		in:      in,
+		out:     out,
+		closing: false,
 	}
+
+	go u.handleBuffer(in, out)
+
+	return u
+}
+
+func (u *UChannel) Close() {
+	u.closing = true
+	u.CloseIn()
 }
 
 func (u *UChannel) CloseIn() {
 	close(u.in)
-}
-
-func (u *UChannel) CloseOut() {
-	close(u.out)
+	u.in = nil
 }
 
 // From Piazza
-func handleBuffer(in <-chan T, out chan<- T) {
+func (u *UChannel) handleBuffer(in <-chan T, out chan<- T) {
 	defer close(out)
 
 	// This list will store all values received from 'in'.
@@ -46,7 +53,7 @@ func handleBuffer(in <-chan T, out chan<- T) {
 			if !ok {
 				// 'in' has been closed. Flush all values
 				// in the buffer and return.
-				flush(buffer, out)
+				u.flush(buffer, out)
 				return
 			}
 			buffer.PushBack(v)
@@ -57,7 +64,7 @@ func handleBuffer(in <-chan T, out chan<- T) {
 			if !ok {
 				// 'in' has been closed. Flush all values
 				// in the buffer and return.
-				flush(buffer, out)
+				u.flush(buffer, out)
 				return
 			}
 			buffer.PushBack(v)
@@ -69,10 +76,14 @@ func handleBuffer(in <-chan T, out chan<- T) {
 
 // Blocks until all values in the buffer have been sent through
 // the 'out' channel.
-func flush(buffer *list.List, out chan<- T) {
+func (u *UChannel) flush(buffer *list.List, out chan<- T) {
+	if out == nil || u.closing { // Out has been closed, forget it.
+		return
+	}
 	for e := buffer.Front(); e != nil; e = e.Next() {
 		out <- (e.Value).(T)
 	}
 	// Signify that the channel has closed.
+
 	out <- (NewAck(-1, -1))
 }
