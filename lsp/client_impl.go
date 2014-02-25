@@ -8,27 +8,27 @@ import (
 	"errors"
 	"fmt"
 	"github.com/cmu440/lspnet"
-	// "io/ioutil"
 	"log"
-	"os"
+	"io/ioutil"
+	// "os"
 	"time"
 )
 
 const (
 	bufferSize          = 1024
-	channelBufferSize   = 40
+	channelBufferSize   = 100
 	readSeqNum          = 0
-	readChanId          = 1
+	readConnId          = 1
 	gracefulShutdown    = 2
-	discconnectShutdown = 3
+	disconnectShutdown = 3
 	gracefulComplete    = 4
 )
 
-var LOGE = log.New(os.Stderr, "  [ERROR]   ", log.Lmicroseconds|log.Lshortfile)
+var LOGE = log.New(ioutil.Discard, "  [ERROR]   ", log.Lmicroseconds|log.Lshortfile)
 
-// var LOGV = log.New(ioutil.Discard, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
+var LOGV = log.New(ioutil.Discard, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
 
-var LOGV = log.New(os.Stdout, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
+// var LOGV = log.New(os.Stdout, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
 
 type client struct {
 	send         chan *Message
@@ -105,14 +105,17 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	// Send a connect message, block until acknowledged
 	c.send <- NewConnect()
 	<-c.connect // Connected!
-	LOGV.Printf("Started connection with ConnID %d", c.connId)
+	if c.connId == -1 {
+		return nil, errors.New("Unable to connect")
+	}
 
+	LOGV.Printf("Started connection with ConnID %d", c.connId)
 	return c, nil
 }
 
 // Returns connection ID.
 func (c *client) ConnID() int {
-	c.requestData <- readChanId //FIXME: Is this lock contentioius? Multiple signals in one channel?
+	c.requestData <- readConnId //FIXME: Is this lock contentioius? Multiple signals in one channel?
 	id := <-c.requestData
 	return id
 }
@@ -159,8 +162,8 @@ func (c *client) Write(payload []byte) error {
 
 func (c *client) Close() error {
 	if c.shutdown != nil {
-		// c.shutdown <- gracefulShutdown
-		c.shutdown <- discconnectShutdown
+		c.shutdown <- gracefulShutdown
+		// c.shutdown <- disconnectShutdown
 	}
 	// _ = <-c.shutdown
 	return nil
@@ -198,7 +201,7 @@ func (c *client) masterHandler() {
 				LOGV.Println("Requesting seq num update")
 				c.seqNum++
 				c.requestData <- c.seqNum
-			case readChanId:
+			case readConnId:
 				LOGV.Println("Requesting connId")
 				c.requestData <- c.connId
 			}
@@ -209,7 +212,7 @@ func (c *client) masterHandler() {
 				// Flush the read pipeline as no more Read()'s will be called
 				c.read.CloseIn()
 
-			} else if flag == discconnectShutdown {
+			} else if flag == disconnectShutdown {
 				LOGV.Println("Disconnectshutdown start")
 				// Do it incorrectly for now
 				close(c.kill)
@@ -217,8 +220,6 @@ func (c *client) masterHandler() {
 				c.conn.Close()
 				LOGV.Println("Disconnectshutdown killed")
 				c.read.CloseIn()
-				c.send = nil
-				c.read = nil
 				LOGV.Println("Disconnectshutdown done")
 				return
 
@@ -296,15 +297,15 @@ func (c *client) netHandler() {
 			n, err := c.conn.Read(buf[0:]) // Block on read
 			if err != nil {
 				LOGE.Println(fmt.Sprint("Error reading, connection probably closed: ", err))
-				c.shutdown <- discconnectShutdown
 			} else {
 
 				// Unmarshal
 				var msg Message
 				json.Unmarshal(buf[0:n], &msg)
 
-				LOGV.Println(fmt.Sprint("Read has occurred: ", msg.String()))
-
+				if msg.Type == MsgData {
+					LOGE.Println(fmt.Sprint("Client read has occurred: ", msg.String()))
+				}
 				c.receive <- &msg
 			}
 		}
@@ -325,7 +326,7 @@ func (c *client) epochHandler() {
 		if c.closeCounter == c.params.EpochLimit {
 			// Waited long enough, should disconnect.
 			LOGV.Printf("Timeout error")
-			c.shutdown <- discconnectShutdown
+			c.shutdown <- disconnectShutdown
 		}
 
 	}

@@ -11,13 +11,12 @@ package lsp
 
 import (
 	"fmt"
+	"github.com/cmu440/lspnet"
 	"math/rand"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/cmu440/lspnet"
 )
 
 type windowTestMode int
@@ -367,6 +366,7 @@ func (ts *windowTestSystem) runMaxCapacityTest() {
 	ts.checkServerReadMsgs(ts.clientSendMsgs)
 
 	// (2) Client to server.
+	LOGE.Println("======================== CLIENT WRITE DROP PERCENT = 100% =================")
 	ts.setClientWriteDropPercent(100) // Don't let clients send acks.
 
 	for connID, cli := range ts.clientMap {
@@ -377,7 +377,11 @@ func (ts *windowTestSystem) runMaxCapacityTest() {
 	for i := 0; i < numClients; i++ {
 		ts.waitForServer() // Wait for the server to finish writing messages to each client.
 	}
+	LOGE.Println("======================== SERVER DONE WRITING =================")
+
 	ts.waitForClients() // Wait for clients to read messages from the server.
+	LOGE.Println("======================== CLIENTS DONE WRITING =================")
+
 	time.Sleep(50 * time.Millisecond)
 
 	// Confirm that the client read the expected messages from the server.

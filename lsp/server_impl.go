@@ -3,14 +3,20 @@
 package lsp
 
 import (
-	// "container/list"
 	"container/list"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/cmu440/lspnet"
+	"io/ioutil"
+	"log"
+	// "os"
 	"time"
 )
+
+var LOGS = log.New(ioutil.Discard, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
+
+// var LOGS = log.New(os.Stdout, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
 
 const (
 	BUFFSIZE = 1024
@@ -26,6 +32,7 @@ type server struct {
 	toRead      *UChannel               // Things waiting to be read
 	connIdCount int                     // What's our next connId?
 	reqSeqNum   chan int                // Request a new seqNumber atomically
+	resSeqNum   chan int                // Send a new seqNumber atomically
 	killClient  chan int                // For closing clients
 	shutdown    chan int                // Request a shutdown
 }
@@ -45,9 +52,6 @@ type clientMessage struct {
 	addr *lspnet.UDPAddr
 	msg  Message
 }
-
-// var LOGE = log.New(os.Stderr, "  [ERROR]   ", log.Lmicroseconds|log.Lshortfile)
-// var LOGV = log.New(ioutil.Discard, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
 
 // NewServer creates, initiates, and returns a new server. This function should
 // NOT block. Instead, it should spawn one or more goroutines (to handle things
@@ -80,6 +84,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		toRead:      NewUnboundedChannel(),
 		connIdCount: 1,
 		reqSeqNum:   make(chan int),
+		resSeqNum:   make(chan int),
 		killClient:  make(chan int),
 		shutdown:    make(chan int),
 	}
@@ -87,6 +92,8 @@ func NewServer(port int, params *Params) (Server, error) {
 	// Start goroutines
 	go s.masterHandler()
 	go s.netHandler()
+
+	LOGV.Println("Server started listening")
 
 	return s, nil
 
@@ -111,7 +118,7 @@ func (s *server) Read() (int, []byte, error) {
 func (s *server) Write(connID int, payload []byte) error {
 
 	s.reqSeqNum <- connID
-	seqNum := <-s.reqSeqNum
+	seqNum := <-s.resSeqNum
 	if seqNum == -1 {
 		LOGE.Printf("Unknown connId %d", connID)
 		return errors.New("Unknown connId")
@@ -147,15 +154,20 @@ func (s *server) masterHandler() {
 	ticker := tick.C
 
 	for {
+		LOGS.Println("Master")
 		select {
 		case <-ticker:
+			LOGS.Println("Epoch")
 			// epoch event
 			s.epochHandler()
 		case clientMsg := <-s.receive:
+			LOGS.Println("received in master")
 			// new inbound message
 			s.receiveHandler(clientMsg)
-		case msg := <-s.send.out:
+		case msgElem := <-s.send.out:
 			// new outbound message
+			msg := (*Message)(msgElem)
+			LOGS.Println(fmt.Sprint("send in master: ", msg.String()))
 
 			// Get it's client
 			client, ok := s.clients[msg.ConnID]
@@ -163,27 +175,28 @@ func (s *server) masterHandler() {
 
 				if msg.Type == MsgData {
 					LOGV.Printf("Checking if %d is >= %d and < %d", msg.SeqNum, client.sWindow.base, client.sWindow.base+client.sWindow.size)
-					if client.sWindow.inWindow(msg) { // Should we queue it
+					if client.sWindow.inWindow(msg) { // Should we send it
 						LOGV.Println(fmt.Sprint("Write adding message to window: ", string(msg.Payload)))
 						client.sWindow.add(msg)
-						s.sendMessage(msg)
-					} else { // Or just send it
+						s.sendMessage(msg, client.addr)
+					} else { // Or just queue it
 						LOGV.Println(fmt.Sprint("Write deferred, queueing: ", string(msg.Payload)))
 						client.toWrite.PushBack(msg)
 					}
 
 				} else {
-					s.sendMessage(msg)
+					s.sendMessage(msg, client.addr)
 				}
 			}
 		case connId := <-s.reqSeqNum:
+			LOGS.Println("connID in master")
 			// Synchronously send new sequence number
 			client, ok := s.clients[connId]
 			if ok {
 				client.seqNum++
-				s.reqSeqNum <- client.seqNum
+				s.resSeqNum <- client.seqNum
 			} else {
-				s.reqSeqNum <- -1
+				s.resSeqNum <- -1
 			}
 		case connId := <-s.killClient:
 			// Attempt to kill a client
@@ -235,6 +248,7 @@ func (s *server) netHandler() {
 func (s *server) epochHandler() {
 	// For every client we know about
 	for connId, client := range s.clients {
+		LOGV.Printf("Kicking off epoch for %d", connId)
 		// Update active connection counters.
 		if client.gotMail == true {
 			client.gotMail = false
@@ -248,22 +262,13 @@ func (s *server) epochHandler() {
 				// Remove client
 				delete(s.clients, connId)    // From the client map
 				delete(s.addrs, client.addr) // and from the address map
+				break
 			}
 		}
 
 		// Resend acknowledgements if window's range = 1
 		if client.sWindow.base == 1 {
 			s.send.in <- client.rWindow.window[0]
-		}
-
-		// Resend any non-ack'd data messages
-		for tmp := client.sWindow.base; tmp < client.sWindow.base+client.sWindow.size; tmp++ {
-			resend, ok := client.sWindow.window[tmp]
-			// If it exists and it's not confirmed, resend it
-			if ok && resend.Type == MsgData {
-				LOGV.Println(fmt.Sprint("Resending data: ", resend.String()))
-				s.send.in <- resend
-			}
 		}
 
 		// Reack last w data messages
@@ -273,7 +278,19 @@ func (s *server) epochHandler() {
 			if ok {
 				reack_msg := NewAck(reack.ConnID, reack.SeqNum)
 				LOGV.Println(fmt.Sprint("Resending ack: ", reack_msg.String()))
-				s.send.in <- reack_msg
+				// s.send.in <- reack_msg
+				s.sendMessage(reack_msg, client.addr)
+			}
+		}
+
+		// Resend any non-ack'd data messages
+		for tmp := client.sWindow.base; tmp < client.sWindow.base+client.sWindow.size; tmp++ {
+			resend, ok := client.sWindow.window[tmp]
+			// If it exists and it's not confirmed, resend it
+			if ok && resend.Type == MsgData {
+				LOGV.Println(fmt.Sprint("Resending data: ", resend.String()))
+				// s.send.in <- resend
+				s.sendMessage(resend, client.addr)
 			}
 		}
 
@@ -325,7 +342,8 @@ func (s *server) receiveHandler(clientMsg *clientMessage) {
 
 		// Add message to that client's received window.
 		client.rWindow.receive(&clientMsg.msg)
-		s.send.in <- NewAck(clientMsg.msg.ConnID, clientMsg.msg.SeqNum)
+		// s.send.in <- NewAck(clientMsg.msg.ConnID, clientMsg.msg.SeqNum)
+		s.sendMessage(NewAck(clientMsg.msg.ConnID, clientMsg.msg.SeqNum), clientMsg.addr)
 
 		// Update read queue
 		for {
@@ -337,7 +355,7 @@ func (s *server) receiveHandler(clientMsg *clientMessage) {
 			}
 		}
 	case MsgAck:
-		LOGV.Println(fmt.Sprint("Got acknowledgement ", clientMsg.msg.String()))
+		LOGS.Println(fmt.Sprint("Got acknowledgement ", clientMsg.msg.String()))
 
 		// Get that client
 		client, ok := s.clients[clientMsg.msg.ConnID]
@@ -374,25 +392,25 @@ func (s *server) receiveHandler(clientMsg *clientMessage) {
 
 }
 
-func (s *server) sendMessage(msg *Message) error {
+func (s *server) sendMessage(msg *Message, addr *lspnet.UDPAddr) error {
 	bytes, err := json.Marshal(msg)
 	if err != nil {
 		return errors.New("Error marshalling")
 	}
 	LOGV.Println(string(bytes))
 
-	client, ok := s.clients[msg.ConnID]
-	if !ok {
-		LOGE.Printf("Attempted to send message to non-existant connID %d", msg.ConnID)
-		return errors.New(fmt.Sprintf("Attempted to send message to non-existant connID %d", msg.ConnID))
-	}
+	// client, ok := s.clients[msg.ConnID]
+	// if !ok {
+	// 	LOGE.Printf("Attempted to send message to non-existant connID %d", msg.ConnID)
+	// 	return errors.New(fmt.Sprintf("Attempted to send message to non-existant connID %d", msg.ConnID))
+	// }
 
-	_, err = s.conn.WriteToUDP(bytes, client.addr)
+	_, err = s.conn.WriteToUDP(bytes, addr)
 	if err != nil {
 		LOGE.Printf("Error writing to connId %d", msg.ConnID)
 		return errors.New("Error writing")
 	}
-	LOGV.Println(fmt.Sprint("Write occurred: ", msg.String()))
+	LOGE.Println(fmt.Sprint("Server write occurred: ", msg.String()))
 
 	return nil
 }
