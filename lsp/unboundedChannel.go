@@ -38,6 +38,7 @@ func (u *UChannel) CloseIn() {
 
 // From Piazza
 func (u *UChannel) handleBuffer(in <-chan T, out chan<- T) {
+	defer LOGE.Println("Shutdown - unbounded channel should be closing now")
 	defer close(out)
 
 	// This list will store all values received from 'in'.

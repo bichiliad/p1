@@ -14,27 +14,31 @@ import (
 	"time"
 )
 
-var LOGS = log.New(ioutil.Discard, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
-
 // var LOGS = log.New(os.Stdout, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
+
+var LOGS = log.New(ioutil.Discard, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
 
 const (
 	BUFFSIZE = 1024
 )
 
 type server struct {
-	clients     map[int]*cli            // Map of all clients
-	addrs       map[*lspnet.UDPAddr]int // Maps addresses to connId's
-	conn        *lspnet.UDPConn         // UDP connection to listen on
-	send        *UChannel               // Channel to send outbound messages on
-	receive     chan *clientMessage     // Channel for inbound messages
-	params      *Params                 // Configurable parameters
-	toRead      *UChannel               // Things waiting to be read
-	connIdCount int                     // What's our next connId?
-	reqSeqNum   chan int                // Request a new seqNumber atomically
-	resSeqNum   chan int                // Send a new seqNumber atomically
-	killClient  chan int                // For closing clients
-	shutdown    chan int                // Request a shutdown
+	clients          map[int]*cli            // Map of all clients
+	addrs            map[*lspnet.UDPAddr]int // Maps addresses to connId's
+	conn             *lspnet.UDPConn         // UDP connection to listen on
+	send             *UChannel               // Channel to send outbound messages on
+	receive          chan *clientMessage     // Channel for inbound messages
+	params           *Params                 // Configurable parameters
+	toRead           *UChannel               // Things waiting to be read
+	connIdCount      int                     // What's our next connId?
+	reqSeqNum        chan int                // Request a new seqNumber atomically
+	resSeqNum        chan int                // Send a new seqNumber atomically
+	killClient       chan int                // For closing clients
+	killClientResult chan int                // For response to client close requests
+	shutdown         chan int                // Request a shutdown
+	shutdownComplete chan int                // Lets Close() know we're done.
+	kill             chan int                // for closing the net handler
+	closing          bool                    // Closing state.
 }
 
 type cli struct {
@@ -75,18 +79,22 @@ func NewServer(port int, params *Params) (Server, error) {
 
 	// Package and return server
 	s := &server{
-		clients:     make(map[int]*cli),
-		addrs:       make(map[*lspnet.UDPAddr]int),
-		conn:        conn,
-		send:        NewUnboundedChannel(),
-		receive:     make(chan *clientMessage, channelBufferSize),
-		params:      params,
-		toRead:      NewUnboundedChannel(),
-		connIdCount: 1,
-		reqSeqNum:   make(chan int),
-		resSeqNum:   make(chan int),
-		killClient:  make(chan int),
-		shutdown:    make(chan int),
+		clients:          make(map[int]*cli),
+		addrs:            make(map[*lspnet.UDPAddr]int),
+		conn:             conn,
+		send:             NewUnboundedChannel(),
+		receive:          make(chan *clientMessage, channelBufferSize),
+		params:           params,
+		toRead:           NewUnboundedChannel(),
+		connIdCount:      1,
+		reqSeqNum:        make(chan int),
+		resSeqNum:        make(chan int),
+		kill:             make(chan int),
+		killClient:       make(chan int),
+		killClientResult: make(chan int),
+		shutdown:         make(chan int),
+		shutdownComplete: make(chan int),
+		closing:          false,
 	}
 
 	// Start goroutines
@@ -100,7 +108,6 @@ func NewServer(port int, params *Params) (Server, error) {
 }
 
 func (s *server) Read() (int, []byte, error) {
-	// TODO: remove this line when you are ready to begin implementing this method.
 	if s.toRead == nil {
 		LOGE.Println("Connection has been closed")
 		return 0, nil, errors.New("Connection has been closed")
@@ -111,6 +118,9 @@ func (s *server) Read() (int, []byte, error) {
 	if msg.Type == MsgAck {
 		LOGE.Println("Connection has been closed")
 		return 0, nil, errors.New("Connection has been closed")
+	} else if msg.Type == MsgConnect {
+		LOGE.Println("A client has disconnected")
+		return 0, nil, errors.New("A client has disconnected")
 	}
 	return msg.ConnID, msg.Payload, nil
 }
@@ -132,43 +142,72 @@ func (s *server) Write(connID int, payload []byte) error {
 
 func (s *server) CloseConn(connID int) error {
 	s.killClient <- connID
-	r := <-s.killClient
+	r := <-s.killClientResult
 	if r == -1 {
+		LOGV.Printf("CloseConn - Client %d does not exist", connID)
 		return errors.New("Unknown client")
 	} else {
+		LOGV.Printf("CloseConn - Successfully killed client %d", connID)
 		return nil
 	}
 }
 
 func (s *server) Close() error {
+	defer LOGS.Println("Server Shutdown - Close() return")
+
+	LOGS.Println("Server Shutdown - Close() called")
 	// Finish it off
 	s.shutdown <- 0
+	LOGS.Println("Server Shutdown - Close() blocking")
+
 	// Block until finished
-	<-s.shutdown
+	<-s.shutdownComplete
 	return nil
+}
+
+func (s *server) doneSending() bool {
+	// Check to see if each client isn't waiting on any acks, and doesn't have queued writes
+	for _, client := range s.clients {
+		if client.sWindow.yetToSend() != 0 || client.toWrite.Len() != 0 {
+			LOGS.Printf("Shutdown - Can't close yet, client %d still has (%d, %d) messages", client.connId,
+				client.sWindow.yetToSend(), client.toWrite.Len())
+			return false
+		}
+	}
+
+	return true
 }
 
 // Central handler, deals with synchronous stuff
 func (s *server) masterHandler() {
+	defer LOGS.Println("Server Shutdown - master Returned")
 	tick := time.NewTicker(time.Duration(s.params.EpochMillis) * time.Millisecond)
 	ticker := tick.C
 
 	for {
-		LOGS.Println("Master")
 		select {
 		case <-ticker:
-			LOGS.Println("Epoch")
 			// epoch event
 			s.epochHandler()
 		case clientMsg := <-s.receive:
-			LOGS.Println("received in master")
 			// new inbound message
 			s.receiveHandler(clientMsg)
+			if s.closing && s.doneSending() {
+				LOGS.Println("Server Shutdown - Starting master shutdown")
+				// This should close the netHandler
+				// s.conn.Close()
+				close(s.kill)
+				// Stop the ticker.
+				tick.Stop()
+				// Close listener
+				s.conn.Close()
+				close(s.shutdownComplete)
+				return
+
+			}
 		case msgElem := <-s.send.out:
 			// new outbound message
 			msg := (*Message)(msgElem)
-			LOGS.Println(fmt.Sprint("send in master: ", msg.String()))
-
 			// Get it's client
 			client, ok := s.clients[msg.ConnID]
 			if ok {
@@ -189,7 +228,6 @@ func (s *server) masterHandler() {
 				}
 			}
 		case connId := <-s.reqSeqNum:
-			LOGS.Println("connID in master")
 			// Synchronously send new sequence number
 			client, ok := s.clients[connId]
 			if ok {
@@ -205,26 +243,31 @@ func (s *server) masterHandler() {
 				// Remove client
 				delete(s.clients, connId)    // From the client map
 				delete(s.addrs, client.addr) // and from the address map
+				s.killClientResult <- 0
 			} else {
-				s.reqSeqNum <- -1
+				s.killClientResult <- -1
 			}
 		case <-s.shutdown:
+			// Set state to closing
+			s.closing = true
 			// No more reads will be called
-			s.toRead.Close()
-			// This should close the netHandler
-			s.conn.Close()
-			// Stop the ticker.
-			tick.Stop()
-			return
+			s.toRead.CloseIn()
+			for _ = range s.toRead.out {
+				// Toss out unread messages
+			}
+			// Business as usual for now.
 		}
 	}
 }
 
 // Listens for inbound messages
 func (s *server) netHandler() {
+	defer LOGS.Println("Server shutdown - netHandler return")
 	var buf [BUFFSIZE]byte // create buffer
 	for {
-		select { // Will be listening on kill signals later
+		select {
+		case <-s.kill:
+			return
 		default:
 			// Wait for new inbound message
 			n, addr, err := s.conn.ReadFromUDP(buf[0:])
@@ -246,9 +289,10 @@ func (s *server) netHandler() {
 }
 
 func (s *server) epochHandler() {
+	LOGV.Printf("Server epoch")
+
 	// For every client we know about
 	for connId, client := range s.clients {
-		LOGV.Printf("Kicking off epoch for %d", connId)
 		// Update active connection counters.
 		if client.gotMail == true {
 			client.gotMail = false
@@ -262,6 +306,7 @@ func (s *server) epochHandler() {
 				// Remove client
 				delete(s.clients, connId)    // From the client map
 				delete(s.addrs, client.addr) // and from the address map
+				s.toRead.in <- NewConnect()
 				break
 			}
 		}
@@ -333,7 +378,7 @@ func (s *server) receiveHandler(clientMsg *clientMessage) {
 		// Are they still connected?
 		client, ok := s.clients[clientMsg.msg.ConnID]
 		if !ok {
-			LOGE.Println(fmt.Sprint("Got message from untracked client: ", clientMsg.msg.String()))
+			LOGS.Println(fmt.Sprint("Got message from untracked client: ", clientMsg.msg.String()))
 			return
 		}
 
@@ -397,7 +442,6 @@ func (s *server) sendMessage(msg *Message, addr *lspnet.UDPAddr) error {
 	if err != nil {
 		return errors.New("Error marshalling")
 	}
-	LOGV.Println(string(bytes))
 
 	// client, ok := s.clients[msg.ConnID]
 	// if !ok {
@@ -410,7 +454,7 @@ func (s *server) sendMessage(msg *Message, addr *lspnet.UDPAddr) error {
 		LOGE.Printf("Error writing to connId %d", msg.ConnID)
 		return errors.New("Error writing")
 	}
-	LOGE.Println(fmt.Sprint("Server write occurred: ", msg.String()))
+	// LOGS.Println(fmt.Sprint("Server write occurred: ", msg.String()))
 
 	return nil
 }

@@ -8,47 +8,48 @@ import (
 	"errors"
 	"fmt"
 	"github.com/cmu440/lspnet"
-	"log"
 	"io/ioutil"
+	"log"
 	// "os"
 	"time"
 )
 
 const (
-	bufferSize          = 1024
-	channelBufferSize   = 100
-	readSeqNum          = 0
-	readConnId          = 1
-	gracefulShutdown    = 2
+	bufferSize         = 1024
+	channelBufferSize  = 100
+	readSeqNum         = 0
+	readConnId         = 1
+	gracefulShutdown   = 2
 	disconnectShutdown = 3
-	gracefulComplete    = 4
+	gracefulComplete   = 4
 )
 
 var LOGE = log.New(ioutil.Discard, "  [ERROR]   ", log.Lmicroseconds|log.Lshortfile)
 
-var LOGV = log.New(ioutil.Discard, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
-
 // var LOGV = log.New(os.Stdout, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
 
+var LOGV = log.New(ioutil.Discard, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
+
 type client struct {
-	send         chan *Message
-	receive      chan *Message
-	connect      chan struct{}
-	requestData  chan int
-	shutdown     chan int
-	kill         chan int
-	read         *UChannel
-	write        *UChannel
-	conn         *lspnet.UDPConn
-	connId       int
-	params       *Params
-	toWrite      *list.List
-	sWindow      *SendWindow
-	rWindow      *ReceiveWindow
-	seqNum       int
-	closing      bool
-	closeCounter int
-	gotMail      bool
+	send             chan *Message
+	receive          chan *Message
+	connect          chan struct{}
+	requestData      chan int
+	shutdown         chan int
+	shutdownComplete chan int
+	kill             chan int
+	read             *UChannel
+	write            *UChannel
+	conn             *lspnet.UDPConn
+	connId           int
+	params           *Params
+	toWrite          *list.List
+	sWindow          *SendWindow
+	rWindow          *ReceiveWindow
+	seqNum           int
+	closing          bool
+	closeCounter     int
+	gotMail          bool
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -78,23 +79,24 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	}
 
 	c := &client{
-		send:         make(chan *Message, channelBufferSize), // For outgoing messages
-		receive:      make(chan *Message, channelBufferSize), // For incoming messages
-		connect:      make(chan struct{}),                    // To signify a successful connection
-		requestData:  make(chan int),                         // For requesting data synchronously
-		shutdown:     make(chan int),                         // To signal a shutdown to the master channel
-		kill:         make(chan int),                         // To alert goroutines to return
-		read:         NewUnboundedChannel(),                  // For queueing messages to Read()
-		conn:         conn,                                   // The dialed UDP connection
-		connId:       -1,                                     // ID of the connection. Set on connection.
-		params:       params,                                 // Parameters
-		toWrite:      list.New(),                             // Queue of yet-to-be-sent messages
-		sWindow:      NewSendWindow(params.WindowSize),       // Create new window
-		rWindow:      NewReceiveWindow(params.WindowSize),    // Create new window
-		seqNum:       0,                                      // Initial sequence number
-		closing:      false,                                  // Are we trying to close right now?
-		closeCounter: 0,                                      // Epochs since last message
-		gotMail:      false,                                  // Did we get a message this epoch
+		send:             make(chan *Message, channelBufferSize), // For outgoing messages
+		receive:          make(chan *Message, channelBufferSize), // For incoming messages
+		connect:          make(chan struct{}),                    // To signify a successful connection
+		requestData:      make(chan int),                         // For requesting data synchronously
+		shutdown:         make(chan int, 1),                      // To signal a shutdown to the master channel
+		shutdownComplete: make(chan int),                         // To tell Close() to unblock
+		kill:             make(chan int),                         // To alert goroutines to return
+		read:             NewUnboundedChannel(),                  // For queueing messages to Read()
+		conn:             conn,                                   // The dialed UDP connection
+		connId:           -1,                                     // ID of the connection. Set on connection.
+		params:           params,                                 // Parameters
+		toWrite:          list.New(),                             // Queue of yet-to-be-sent messages
+		sWindow:          NewSendWindow(params.WindowSize),       // Create new window
+		rWindow:          NewReceiveWindow(params.WindowSize),    // Create new window
+		seqNum:           0,                                      // Initial sequence number
+		closing:          false,                                  // Are we trying to close right now?
+		closeCounter:     0,                                      // Epochs since last message
+		gotMail:          false,                                  // Did we get a message this epoch
 	}
 
 	// Start Master, Net, and Epoch.
@@ -161,11 +163,10 @@ func (c *client) Write(payload []byte) error {
 }
 
 func (c *client) Close() error {
-	if c.shutdown != nil {
-		c.shutdown <- gracefulShutdown
-		// c.shutdown <- disconnectShutdown
-	}
-	// _ = <-c.shutdown
+	defer LOGV.Println("Shutdown - Close() has unblocked")
+	c.shutdown <- gracefulShutdown
+	LOGV.Println("Shutdown - waiting for shutdown")
+	<-c.shutdownComplete
 	return nil
 }
 
@@ -174,7 +175,10 @@ func (c *client) Close() error {
 //
 
 func (c *client) masterHandler() {
-	ticker := time.Tick(time.Duration(c.params.EpochMillis) * time.Millisecond)
+	defer LOGV.Println("Shutdown - masterhandler closing now")
+
+	tick := time.NewTicker(time.Duration(c.params.EpochMillis) * time.Millisecond)
+	ticker := tick.C
 
 	for {
 		select {
@@ -185,6 +189,16 @@ func (c *client) masterHandler() {
 			LOGV.Printf(fmt.Sprint("Received: ", msg.String()))
 			// Handle that ish.
 			c.onReceive(msg)
+
+			// Check if we should return. If there's a data msg in the window, we must wait on it
+			if c.closing && c.sWindow.yetToSend() == 0 && c.toWrite.Len() == 0 {
+				LOGV.Println("Done waiting on everything")
+				close(c.kill)             // Kill net handler
+				tick.Stop()               // Kill the ticker
+				c.conn.Close()            // Close the connection
+				close(c.shutdownComplete) // Tell Close() that we're done
+				return
+			}
 
 		case msg := <-c.send: // Attempting to send message
 			if msg == nil {
@@ -208,19 +222,22 @@ func (c *client) masterHandler() {
 
 		case flag := <-c.shutdown: // Shutdown case
 			if flag == gracefulShutdown {
+				// Set the state to closing.
 				c.closing = true
-				// Flush the read pipeline as no more Read()'s will be called
+				// Flush the read queue as no more Read()'s will be called
 				c.read.CloseIn()
+				for _ = range c.read.out {
+					// Do nothing, empty the queue. All those poor, poor reads.
+				}
 
 			} else if flag == disconnectShutdown {
-				LOGV.Println("Disconnectshutdown start")
+				LOGS.Println("Disconnectshutdown start")
 				// Do it incorrectly for now
 				close(c.kill)
-				c.kill = nil
 				c.conn.Close()
-				LOGV.Println("Disconnectshutdown killed")
-				c.read.CloseIn()
-				LOGV.Println("Disconnectshutdown done")
+				LOGS.Println("Disconnectshutdown killed")
+				c.read.CloseIn() // Close read input, leave output alone.
+				LOGS.Println("Disconnectshutdown done")
 				return
 
 			}
@@ -257,12 +274,6 @@ func (c *client) onReceive(msg *Message) {
 					c.toWrite.Remove(next)
 				}
 			}
-
-			// Check if we should return. If there's a data msg in the window, we must wait on it
-			if c.closing && c.sWindow.yetToSend() == 0 {
-				LOGV.Println("Done waiting on everything")
-				c.shutdown <- gracefulComplete
-			}
 		}
 
 	case MsgData:
@@ -286,11 +297,12 @@ func (c *client) onReceive(msg *Message) {
 }
 
 func (c *client) netHandler() {
+	defer LOGV.Println("Shutdown - net handler closed")
+
 	var buf [bufferSize]byte // Create buffer
 	for {
 		select {
 		case <-c.kill:
-			LOGV.Println("Shutdown - Net handler closed")
 			return
 
 		default:
@@ -315,7 +327,7 @@ func (c *client) netHandler() {
 
 func (c *client) epochHandler() {
 
-	LOGV.Println("Epoch!")
+	LOGV.Printf("Client %d epoch", c.connId)
 	// check if disconnected
 	if c.gotMail == true {
 		c.gotMail = false
