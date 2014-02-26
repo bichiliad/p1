@@ -7,18 +7,16 @@ import (
 type T *Message
 
 type UChannel struct {
-	in      chan T // input
-	out     chan T // output
-	closing bool
+	in  chan T // input
+	out chan T // output
 }
 
 func NewUnboundedChannel() *UChannel {
 	in, out := make(chan T), make(chan T)
 
 	u := &UChannel{
-		in:      in,
-		out:     out,
-		closing: false,
+		in:  in,
+		out: out,
 	}
 
 	go u.handleBuffer(in, out)
@@ -26,19 +24,14 @@ func NewUnboundedChannel() *UChannel {
 	return u
 }
 
-func (u *UChannel) Close() {
-	u.closing = true
-	u.CloseIn()
-}
-
 func (u *UChannel) CloseIn() {
 	close(u.in)
-	u.in = nil
+	// u.in = nil
 }
 
 // From Piazza
 func (u *UChannel) handleBuffer(in <-chan T, out chan<- T) {
-	defer LOGE.Println("Shutdown - unbounded channel should be closing now")
+	defer LOGV.Println("Shutdown - unbounded channel should be closing now")
 	defer close(out)
 
 	// This list will store all values received from 'in'.
@@ -78,9 +71,7 @@ func (u *UChannel) handleBuffer(in <-chan T, out chan<- T) {
 // Blocks until all values in the buffer have been sent through
 // the 'out' channel.
 func (u *UChannel) flush(buffer *list.List, out chan<- T) {
-	if out == nil || u.closing { // Out has been closed, forget it.
-		return
-	}
+
 	for e := buffer.Front(); e != nil; e = e.Next() {
 		out <- (e.Value).(T)
 	}

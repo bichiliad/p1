@@ -26,30 +26,32 @@ const (
 
 var LOGE = log.New(ioutil.Discard, "  [ERROR]   ", log.Lmicroseconds|log.Lshortfile)
 
-// var LOGV = log.New(os.Stdout, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
-
 var LOGV = log.New(ioutil.Discard, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
 
+// var LOGV = log.New(ioutil.Discard, "  [VERBOSE] ", log.Lmicroseconds|log.Lshortfile)
+
 type client struct {
-	send             chan *Message
-	receive          chan *Message
-	connect          chan struct{}
-	requestData      chan int
-	shutdown         chan int
-	shutdownComplete chan int
-	kill             chan int
-	read             *UChannel
-	write            *UChannel
-	conn             *lspnet.UDPConn
-	connId           int
-	params           *Params
-	toWrite          *list.List
-	sWindow          *SendWindow
-	rWindow          *ReceiveWindow
-	seqNum           int
-	closing          bool
-	closeCounter     int
-	gotMail          bool
+	send               chan *Message
+	receive            chan *Message
+	connect            chan struct{}
+	requestData        chan int
+	shutdown           chan int
+	disconnectShutdown chan int
+	shutdownComplete   chan int
+	kill               chan int
+	read               *UChannel
+	write              *UChannel
+	conn               *lspnet.UDPConn
+	connId             int
+	params             *Params
+	toWrite            *list.List
+	sWindow            *SendWindow
+	rWindow            *ReceiveWindow
+	seqNum             int
+	closing            bool
+	closeCounter       int
+	gotMail            bool
+	disconnected       bool
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -79,24 +81,26 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	}
 
 	c := &client{
-		send:             make(chan *Message, channelBufferSize), // For outgoing messages
-		receive:          make(chan *Message, channelBufferSize), // For incoming messages
-		connect:          make(chan struct{}),                    // To signify a successful connection
-		requestData:      make(chan int),                         // For requesting data synchronously
-		shutdown:         make(chan int, 1),                      // To signal a shutdown to the master channel
-		shutdownComplete: make(chan int),                         // To tell Close() to unblock
-		kill:             make(chan int),                         // To alert goroutines to return
-		read:             NewUnboundedChannel(),                  // For queueing messages to Read()
-		conn:             conn,                                   // The dialed UDP connection
-		connId:           -1,                                     // ID of the connection. Set on connection.
-		params:           params,                                 // Parameters
-		toWrite:          list.New(),                             // Queue of yet-to-be-sent messages
-		sWindow:          NewSendWindow(params.WindowSize),       // Create new window
-		rWindow:          NewReceiveWindow(params.WindowSize),    // Create new window
-		seqNum:           0,                                      // Initial sequence number
-		closing:          false,                                  // Are we trying to close right now?
-		closeCounter:     0,                                      // Epochs since last message
-		gotMail:          false,                                  // Did we get a message this epoch
+		send:               make(chan *Message, channelBufferSize), // For outgoing messages
+		receive:            make(chan *Message, channelBufferSize), // For incoming messages
+		connect:            make(chan struct{}),                    // To signify a successful connection
+		requestData:        make(chan int),                         // For requesting data synchronously
+		shutdown:           make(chan int, 1),                      // To signal a shutdown to the master channel
+		disconnectShutdown: make(chan int, 1),
+		shutdownComplete:   make(chan int, 1),                   // To tell Close() to unblock
+		kill:               make(chan int),                      // To alert goroutines to return
+		read:               NewUnboundedChannel(),               // For queueing messages to Read()
+		conn:               conn,                                // The dialed UDP connection
+		connId:             -1,                                  // ID of the connection. Set on connection.
+		params:             params,                              // Parameters
+		toWrite:            list.New(),                          // Queue of yet-to-be-sent messages
+		sWindow:            NewSendWindow(params.WindowSize),    // Create new window
+		rWindow:            NewReceiveWindow(params.WindowSize), // Create new window
+		seqNum:             0,                                   // Initial sequence number
+		closing:            false,                               // Are we trying to close right now?
+		closeCounter:       0,                                   // Epochs since last message
+		gotMail:            false,                               // Did we get a message this epoch
+		disconnected:       false,
 	}
 
 	// Start Master, Net, and Epoch.
@@ -164,6 +168,8 @@ func (c *client) Write(payload []byte) error {
 
 func (c *client) Close() error {
 	defer LOGV.Println("Shutdown - Close() has unblocked")
+
+	LOGV.Println("Shutdown - Close() called")
 	c.shutdown <- gracefulShutdown
 	LOGV.Println("Shutdown - waiting for shutdown")
 	<-c.shutdownComplete
@@ -182,6 +188,20 @@ func (c *client) masterHandler() {
 
 	for {
 		select {
+		case <-c.disconnectShutdown:
+			LOGS.Println("Disconnect - Disconnectshutdown start")
+			// Do it incorrectly for now
+			close(c.kill)
+			c.conn.Close()
+			LOGS.Println("Disconnect - Disconnectshutdown killed")
+			if c.closing == false {
+				c.read.CloseIn() // Close read input, leave output alone.
+			}
+
+			LOGS.Println("Disconnect - Disconnectshutdown done")
+			close(c.shutdownComplete)
+			return
+
 		case <-ticker:
 			c.epochHandler()
 		case msg := <-c.receive: // Just got an inbound message, oh boy.
@@ -229,18 +249,8 @@ func (c *client) masterHandler() {
 				for _ = range c.read.out {
 					// Do nothing, empty the queue. All those poor, poor reads.
 				}
-
-			} else if flag == disconnectShutdown {
-				LOGS.Println("Disconnectshutdown start")
-				// Do it incorrectly for now
-				close(c.kill)
-				c.conn.Close()
-				LOGS.Println("Disconnectshutdown killed")
-				c.read.CloseIn() // Close read input, leave output alone.
-				LOGS.Println("Disconnectshutdown done")
-				return
-
 			}
+
 		}
 
 	}
@@ -338,7 +348,11 @@ func (c *client) epochHandler() {
 		if c.closeCounter == c.params.EpochLimit {
 			// Waited long enough, should disconnect.
 			LOGV.Printf("Timeout error")
-			c.shutdown <- disconnectShutdown
+			LOGV.Printf("Disconnect - Sending discononect signal")
+			c.disconnectShutdown <- disconnectShutdown
+			c.disconnected = true
+			LOGV.Printf("Disconnect - Exiting epoch")
+			return
 		}
 
 	}

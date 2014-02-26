@@ -344,7 +344,6 @@ func (s *server) epochHandler() {
 }
 
 func (s *server) receiveHandler(clientMsg *clientMessage) {
-	LOGV.Println("=== Got a new message: ", clientMsg.msg.String())
 	switch clientMsg.msg.Type {
 	case MsgConnect:
 		// Do we have a connection for them yet? If so, nothing to do here
@@ -362,7 +361,6 @@ func (s *server) receiveHandler(clientMsg *clientMessage) {
 				toWrite:      list.New(),
 			}
 
-			LOGV.Printf("=== Client %d connected", cl.connId)
 			confirmation := NewAck(s.connIdCount, 0)
 
 			// Add connection confirmation to receiveWindow so it gets sent out on epochs
