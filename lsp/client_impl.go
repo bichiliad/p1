@@ -334,7 +334,7 @@ func (c *client) epochHandler() {
 		c.closeCounter = 0
 	} else {
 		c.closeCounter++
-		LOGV.Printf("Timeout count %d", c.closeCounter)
+		LOGV.Printf("Timeout count %d of %d", c.closeCounter, c.params.EpochLimit)
 		if c.closeCounter == c.params.EpochLimit {
 			// Waited long enough, should disconnect.
 			LOGV.Printf("Timeout error")

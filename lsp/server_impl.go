@@ -23,22 +23,22 @@ const (
 )
 
 type server struct {
-	clients          map[int]*cli            // Map of all clients
-	addrs            map[*lspnet.UDPAddr]int // Maps addresses to connId's
-	conn             *lspnet.UDPConn         // UDP connection to listen on
-	send             *UChannel               // Channel to send outbound messages on
-	receive          chan *clientMessage     // Channel for inbound messages
-	params           *Params                 // Configurable parameters
-	toRead           *UChannel               // Things waiting to be read
-	connIdCount      int                     // What's our next connId?
-	reqSeqNum        chan int                // Request a new seqNumber atomically
-	resSeqNum        chan int                // Send a new seqNumber atomically
-	killClient       chan int                // For closing clients
-	killClientResult chan int                // For response to client close requests
-	shutdown         chan int                // Request a shutdown
-	shutdownComplete chan int                // Lets Close() know we're done.
-	kill             chan int                // for closing the net handler
-	closing          bool                    // Closing state.
+	clients          map[int]*cli        // Map of all clients
+	addrs            map[string]int      // Maps addresses to connId's
+	conn             *lspnet.UDPConn     // UDP connection to listen on
+	send             *UChannel           // Channel to send outbound messages on
+	receive          chan *clientMessage // Channel for inbound messages
+	params           *Params             // Configurable parameters
+	toRead           *UChannel           // Things waiting to be read
+	connIdCount      int                 // What's our next connId?
+	reqSeqNum        chan int            // Request a new seqNumber atomically
+	resSeqNum        chan int            // Send a new seqNumber atomically
+	killClient       chan int            // For closing clients
+	killClientResult chan int            // For response to client close requests
+	shutdown         chan int            // Request a shutdown
+	shutdownComplete chan int            // Lets Close() know we're done.
+	kill             chan int            // for closing the net handler
+	closing          bool                // Closing state.
 }
 
 type cli struct {
@@ -80,7 +80,7 @@ func NewServer(port int, params *Params) (Server, error) {
 	// Package and return server
 	s := &server{
 		clients:          make(map[int]*cli),
-		addrs:            make(map[*lspnet.UDPAddr]int),
+		addrs:            make(map[string]int),
 		conn:             conn,
 		send:             NewUnboundedChannel(),
 		receive:          make(chan *clientMessage, channelBufferSize),
@@ -101,7 +101,7 @@ func NewServer(port int, params *Params) (Server, error) {
 	go s.masterHandler()
 	go s.netHandler()
 
-	LOGV.Println("Server started listening")
+	LOGS.Println("Server started listening")
 
 	return s, nil
 
@@ -134,13 +134,14 @@ func (s *server) Write(connID int, payload []byte) error {
 		return errors.New("Unknown connId")
 	} else {
 		msg := NewData(connID, seqNum, payload)
-		LOGV.Println(fmt.Sprint("Write requested: ", msg.String()))
+		LOGS.Println(fmt.Sprint("Write requested: ", msg.String()))
 		s.send.in <- msg
 		return nil
 	}
 }
 
 func (s *server) CloseConn(connID int) error {
+	LOGV.Printf("CloseConn - called with id %d", connID)
 	s.killClient <- connID
 	r := <-s.killClientResult
 	if r == -1 {
@@ -213,13 +214,13 @@ func (s *server) masterHandler() {
 			if ok {
 
 				if msg.Type == MsgData {
-					LOGV.Printf("Checking if %d is >= %d and < %d", msg.SeqNum, client.sWindow.base, client.sWindow.base+client.sWindow.size)
+					LOGS.Printf("Checking if %d is >= %d and < %d", msg.SeqNum, client.sWindow.base, client.sWindow.base+client.sWindow.size)
 					if client.sWindow.inWindow(msg) { // Should we send it
-						LOGV.Println(fmt.Sprint("Write adding message to window: ", string(msg.Payload)))
+						LOGS.Println(fmt.Sprint("Write adding message to window: ", string(msg.Payload)))
 						client.sWindow.add(msg)
 						s.sendMessage(msg, client.addr)
 					} else { // Or just queue it
-						LOGV.Println(fmt.Sprint("Write deferred, queueing: ", string(msg.Payload)))
+						LOGS.Println(fmt.Sprint("Write deferred, queueing: ", string(msg.Payload)))
 						client.toWrite.PushBack(msg)
 					}
 
@@ -241,8 +242,8 @@ func (s *server) masterHandler() {
 			client, ok := s.clients[connId]
 			if ok {
 				// Remove client
-				delete(s.clients, connId)    // From the client map
-				delete(s.addrs, client.addr) // and from the address map
+				delete(s.clients, connId)             // From the client map
+				delete(s.addrs, client.addr.String()) // and from the address map
 				s.killClientResult <- 0
 			} else {
 				s.killClientResult <- -1
@@ -277,7 +278,7 @@ func (s *server) netHandler() {
 			} else {
 				var msg Message
 				json.Unmarshal(buf[0:n], &msg)
-				LOGV.Println(fmt.Sprint("Read has occurred: ", msg.String()))
+				LOGS.Println(fmt.Sprint("Read has occurred: ", msg.String()))
 
 				s.receive <- &clientMessage{
 					addr: addr,
@@ -289,7 +290,7 @@ func (s *server) netHandler() {
 }
 
 func (s *server) epochHandler() {
-	LOGV.Printf("Server epoch")
+	LOGS.Printf("Server epoch")
 
 	// For every client we know about
 	for connId, client := range s.clients {
@@ -299,13 +300,13 @@ func (s *server) epochHandler() {
 			client.timeoutCount = 0
 		} else {
 			client.timeoutCount++
-			LOGV.Printf("Timeout count for client %d is %d", connId, client.timeoutCount)
+			LOGS.Printf("Timeout count for client %d is %d", connId, client.timeoutCount)
 			if client.timeoutCount == s.params.EpochLimit {
-				LOGV.Printf("Timeout on client %d", connId)
+				LOGS.Printf("Timeout on client %d", connId)
 
 				// Remove client
-				delete(s.clients, connId)    // From the client map
-				delete(s.addrs, client.addr) // and from the address map
+				delete(s.clients, connId)             // From the client map
+				delete(s.addrs, client.addr.String()) // and from the address map
 				s.toRead.in <- NewConnect()
 				break
 			}
@@ -322,7 +323,7 @@ func (s *server) epochHandler() {
 			// There's a message in this bucket, reack it.
 			if ok {
 				reack_msg := NewAck(reack.ConnID, reack.SeqNum)
-				LOGV.Println(fmt.Sprint("Resending ack: ", reack_msg.String()))
+				LOGS.Println(fmt.Sprint("Resending ack: ", reack_msg.String()))
 				// s.send.in <- reack_msg
 				s.sendMessage(reack_msg, client.addr)
 			}
@@ -333,7 +334,7 @@ func (s *server) epochHandler() {
 			resend, ok := client.sWindow.window[tmp]
 			// If it exists and it's not confirmed, resend it
 			if ok && resend.Type == MsgData {
-				LOGV.Println(fmt.Sprint("Resending data: ", resend.String()))
+				LOGS.Println(fmt.Sprint("Resending data: ", resend.String()))
 				// s.send.in <- resend
 				s.sendMessage(resend, client.addr)
 			}
@@ -343,10 +344,11 @@ func (s *server) epochHandler() {
 }
 
 func (s *server) receiveHandler(clientMsg *clientMessage) {
+	LOGV.Println("=== Got a new message: ", clientMsg.msg.String())
 	switch clientMsg.msg.Type {
 	case MsgConnect:
 		// Do we have a connection for them yet? If so, nothing to do here
-		_, ok := s.addrs[clientMsg.addr]
+		_, ok := s.addrs[clientMsg.addr.String()]
 		if !ok {
 			// Make new connection
 			cl := &cli{
@@ -360,7 +362,7 @@ func (s *server) receiveHandler(clientMsg *clientMessage) {
 				toWrite:      list.New(),
 			}
 
-			LOGV.Printf("Client %d connected", cl.connId)
+			LOGV.Printf("=== Client %d connected", cl.connId)
 			confirmation := NewAck(s.connIdCount, 0)
 
 			// Add connection confirmation to receiveWindow so it gets sent out on epochs
@@ -368,7 +370,7 @@ func (s *server) receiveHandler(clientMsg *clientMessage) {
 
 			// Update maps
 			s.clients[cl.connId] = cl
-			s.addrs[clientMsg.addr] = cl.connId
+			s.addrs[clientMsg.addr.String()] = cl.connId
 
 			// Send message, update connection counter
 			s.send.in <- confirmation
